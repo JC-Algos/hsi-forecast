@@ -189,6 +189,194 @@ def calculate_gap_adjustment(features: pd.Series) -> tuple[float, float, str]:
     return high_adj, low_adj, reason
 
 
+def calculate_signal_alignment(features: pd.Series, predicted_direction: str) -> dict:
+    """
+    Calculate confidence based on how ALL factors align with the predicted direction.
+    
+    Factors considered:
+    - Technical: Price vs EMA20, Price vs MA5, HSI momentum
+    - Overnight: FXI, SPX, NDX changes
+    - Currency: USDCNH (inverted - CNH strength = bullish)
+    - Volatility: VIX level and change
+    
+    Returns:
+        dict with alignment score, factor breakdown, and confidence
+    """
+    
+    # Define all factors with their bullish/bearish interpretation
+    # Positive value = bullish signal, negative = bearish
+    factors = []
+    
+    # === TECHNICAL FACTORS ===
+    hsi_close = features.get("hsi_prev_close", 0)
+    ema20 = features.get("hsi_ema20", hsi_close)
+    ma5 = features.get("hsi_ma5", hsi_close)
+    hsi_change = features.get("hsi_change_pct", 0)
+    
+    # Price vs EMA20 (above = bullish)
+    if ema20 > 0:
+        ema20_signal = (hsi_close - ema20) / ema20
+        factors.append({
+            "name": "EMA20",
+            "signal": ema20_signal,
+            "weight": 0.12,
+            "display": f"{'>' if hsi_close > ema20 else '<'}EMA20",
+            "bullish": hsi_close > ema20
+        })
+    
+    # Price vs MA5 (above = bullish)
+    if ma5 > 0:
+        ma5_signal = (hsi_close - ma5) / ma5
+        factors.append({
+            "name": "MA5",
+            "signal": ma5_signal,
+            "weight": 0.08,
+            "display": f"{'>' if hsi_close > ma5 else '<'}MA5",
+            "bullish": hsi_close > ma5
+        })
+    
+    # HSI momentum (yesterday's change)
+    factors.append({
+        "name": "Momentum",
+        "signal": hsi_change,
+        "weight": 0.08,
+        "display": f"HSI{hsi_change*100:+.1f}%",
+        "bullish": hsi_change > 0
+    })
+    
+    # === OVERNIGHT FACTORS ===
+    fxi_change = features.get("fxi_change_pct", 0)
+    spx_change = features.get("spx_change_pct", 0)
+    ndx_change = features.get("ndx_change_pct", 0)
+    
+    # FXI (most important overnight indicator)
+    factors.append({
+        "name": "FXI",
+        "signal": fxi_change,
+        "weight": 0.20,  # Highest weight - best HK proxy
+        "display": f"FXI{fxi_change*100:+.1f}%",
+        "bullish": fxi_change > 0
+    })
+    
+    # SPX
+    factors.append({
+        "name": "SPX",
+        "signal": spx_change,
+        "weight": 0.12,
+        "display": f"SPX{spx_change*100:+.1f}%",
+        "bullish": spx_change > 0
+    })
+    
+    # NDX
+    factors.append({
+        "name": "NDX",
+        "signal": ndx_change,
+        "weight": 0.10,
+        "display": f"NDX{ndx_change*100:+.1f}%",
+        "bullish": ndx_change > 0
+    })
+    
+    # === CURRENCY FACTOR ===
+    usdcnh_change = features.get("usdcnh_change_pct", 0)
+    # USDCNH up = USD stronger = CNH weaker = bearish for HK
+    factors.append({
+        "name": "CNH",
+        "signal": -usdcnh_change,  # Inverted
+        "weight": 0.10,
+        "display": f"CNH{-usdcnh_change*100:+.1f}%",
+        "bullish": usdcnh_change < 0  # CNH strengthening is bullish
+    })
+    
+    # === VOLATILITY FACTORS ===
+    vix = features.get("vix", 20)
+    vix_change = features.get("vix_change_pct", 0)
+    
+    # VIX level (low VIX = bullish, high = bearish)
+    # Neutral at 20, bullish below, bearish above
+    vix_level_signal = (20 - vix) / 20  # Positive when VIX < 20
+    factors.append({
+        "name": "VIX_Level",
+        "signal": vix_level_signal,
+        "weight": 0.10,
+        "display": f"VIX={vix:.0f}",
+        "bullish": vix < 20
+    })
+    
+    # VIX change (VIX down = bullish, up = bearish)
+    factors.append({
+        "name": "VIX_Chg",
+        "signal": -vix_change,  # Inverted
+        "weight": 0.10,
+        "display": f"VIX{vix_change*100:+.1f}%",
+        "bullish": vix_change < 0
+    })
+    
+    # === CALCULATE DIFFUSION ===
+    # Diffusion = bullish count - bearish count
+    # Positive = net bullish, Negative = net bearish
+    
+    bullish_factors = []
+    bearish_factors = []
+    neutral_factors = []
+    
+    # Also calculate weighted diffusion
+    weighted_bull = 0.0
+    weighted_bear = 0.0
+    total_weight = 0.0
+    
+    for f in factors:
+        total_weight += f["weight"]
+        threshold = 0.001  # 0.1% threshold
+        
+        if abs(f["signal"]) < threshold:
+            neutral_factors.append(f)
+        elif f["bullish"]:
+            bullish_factors.append(f)
+            weighted_bull += f["weight"]
+        else:
+            bearish_factors.append(f)
+            weighted_bear += f["weight"]
+    
+    # Simple diffusion (count-based)
+    diffusion = len(bullish_factors) - len(bearish_factors)
+    
+    # Weighted diffusion (-1 to +1 scale)
+    weighted_diffusion = (weighted_bull - weighted_bear) / total_weight if total_weight > 0 else 0
+    
+    # Diffusion direction
+    if diffusion > 0:
+        diffusion_direction = "UP"
+    elif diffusion < 0:
+        diffusion_direction = "DOWN"
+    else:
+        diffusion_direction = "NEUTRAL"
+    
+    # Signal strength (average magnitude of all non-neutral factors)
+    active_factors = bullish_factors + bearish_factors
+    if active_factors:
+        avg_magnitude = sum(abs(f["signal"]) for f in active_factors) / len(active_factors)
+        strength = min(1.0, avg_magnitude / 0.01)  # 1% avg = full strength
+    else:
+        strength = 0.0
+    
+    # Format display
+    bull_display = [f["display"] for f in bullish_factors]
+    bear_display = [f["display"] for f in bearish_factors]
+    
+    return {
+        "diffusion": diffusion,  # Simple count: bull - bear
+        "weighted_diffusion": weighted_diffusion,  # Weighted: -1 to +1
+        "diffusion_direction": diffusion_direction,
+        "strength": strength,
+        "bullish_count": len(bullish_factors),
+        "bearish_count": len(bearish_factors),
+        "neutral_count": len(neutral_factors),
+        "total_factors": len(factors),
+        "bullish_factors": bull_display,
+        "bearish_factors": bear_display,
+    }
+
+
 def predict_today(output_format: str = "json") -> dict:
     """
     Make prediction for today's HSI range and direction.
@@ -215,6 +403,10 @@ def predict_today(output_format: str = "json") -> dict:
     high_pct_base = model_high.predict(X)[0]
     low_pct_base = model_low.predict(X)[0]
     direction_prob = model_dir.predict_proba(X)[0, 1]
+    predicted_direction = "UP" if direction_prob > 0.5 else "DOWN"
+    
+    # Calculate signal alignment for confidence
+    signal_alignment = calculate_signal_alignment(features, predicted_direction)
     
     # Calculate volatility multiplier
     vol_multiplier, vol_regime, vol_ratio = calculate_volatility_multiplier(df)
@@ -238,25 +430,60 @@ def predict_today(output_format: str = "json") -> dict:
     predicted_high = yesterday_close * (1 + high_pct / 100)
     predicted_low = yesterday_close * (1 + low_pct / 100)
     
+    # === DIFFUSION-BASED CONFIDENCE ===
+    # Diffusion = bullish - bearish (range: -9 to +9)
+    # Positive = net bullish, Negative = net bearish
+    diffusion = signal_alignment["diffusion"]
+    total_factors = signal_alignment["total_factors"]
+    
+    # Check if model and diffusion agree
+    model_is_bullish = (predicted_direction == "UP")
+    diffusion_is_bullish = (diffusion > 0)
+    diffusion_is_bearish = (diffusion < 0)
+    
+    # Agreement check:
+    # - Model UP + Diffusion positive = agree
+    # - Model DOWN + Diffusion negative = agree
+    # - Otherwise = disagree (or neutral if diffusion = 0)
+    
+    if diffusion == 0:
+        # Neutral - no boost or penalty
+        agrees = True  # Treat as neutral agreement
+        final_confidence = 0.50
+    elif (model_is_bullish and diffusion_is_bullish) or (not model_is_bullish and diffusion_is_bearish):
+        # Model and diffusion AGREE
+        agrees = True
+        # Confidence = 50% + (|diffusion|/9 × 50%)
+        final_confidence = 0.50 + (abs(diffusion) / total_factors) * 0.50
+    else:
+        # Model and diffusion DISAGREE
+        agrees = False
+        # Confidence = 50% - (|diffusion|/9 × 50%)
+        final_confidence = 0.50 - (abs(diffusion) / total_factors) * 0.50
+    
     result = {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "prediction_time": datetime.now().isoformat(),
-        "reference_price": float(yesterday_close),  # Yesterday's close as reference
+        "reference_price": float(yesterday_close),
         "predicted_high_pct": float(round(high_pct, 3)),
         "predicted_low_pct": float(round(low_pct, 3)),
         "predicted_high": int(round(predicted_high)),
         "predicted_low": int(round(predicted_low)),
         "predicted_range": int(round(predicted_high - predicted_low)),
         "predicted_range_pct": float(round(high_pct - low_pct, 3)),
-        "direction_prob": float(round(direction_prob, 3)),
-        "direction": "UP" if direction_prob > 0.5 else "DOWN",
-        "confidence": float(round(abs(direction_prob - 0.5) * 2, 3)),  # 0-1 scale
+        "model_prob": float(round(direction_prob, 3)),
+        "direction": predicted_direction,
+        "confidence": float(round(final_confidence, 3)),
+        "diffusion": diffusion,
+        "bullish_count": signal_alignment["bullish_count"],
+        "bearish_count": signal_alignment["bearish_count"],
+        "total_factors": total_factors,
+        "bullish_factors": signal_alignment["bullish_factors"],
+        "bearish_factors": signal_alignment["bearish_factors"],
+        "model_diffusion_agree": agrees,
         "volatility_regime": vol_regime,
         "volatility_multiplier": float(round(vol_multiplier, 2)),
-        "volatility_ratio": float(round(vol_ratio, 2)),
         "gap_adjustment": gap_reason,
-        "gap_high_adj": float(round(gap_high_adj, 3)),
-        "gap_low_adj": float(round(gap_low_adj, 3)),
     }
     
     return result
@@ -265,7 +492,8 @@ def predict_today(output_format: str = "json") -> dict:
 def format_telegram(result: dict) -> str:
     """Format prediction for Telegram message."""
     direction_emoji = "📈" if result["direction"] == "UP" else "📉"
-    confidence_bar = "█" * int(result["confidence"] * 10) + "░" * (10 - int(result["confidence"] * 10))
+    confidence_pct = result["confidence"]
+    confidence_bar = "█" * int(confidence_pct * 10) + "░" * (10 - int(confidence_pct * 10))
     
     # Volatility regime emoji
     vol_emoji = {
@@ -275,19 +503,36 @@ def format_telegram(result: dict) -> str:
         "EXTREME": "🔥"
     }.get(result["volatility_regime"], "📊")
     
-    msg = f"""🎯 **HSI Daily Forecast** ({result['date']})
+    # Diffusion
+    diffusion = result.get("diffusion", 0)
+    bullish_count = result.get("bullish_count", 0)
+    bearish_count = result.get("bearish_count", 0)
+    
+    # Model vs diffusion agreement
+    agree = result.get("model_diffusion_agree", True)
+    agree_emoji = "✓" if agree else "⚠️"
+    
+    bullish_factors = result.get("bullish_factors", [])
+    bearish_factors = result.get("bearish_factors", [])
+    
+    # Format factor lists
+    bull_str = ", ".join(bullish_factors) if bullish_factors else "None"
+    bear_str = ", ".join(bearish_factors) if bearish_factors else "None"
+    
+    msg = f"""🎯 **HSI Forecast** ({result['date']})
 
-{direction_emoji} **Direction: {result['direction']}** ({result['direction_prob']:.1%})
-Confidence: [{confidence_bar}] {result['confidence']:.1%}
+{direction_emoji} **{result['direction']}** | Confidence: **{confidence_pct:.0%}**
+[{confidence_bar}]
 
-📊 **Predicted Range (from prev close):**
-• High: {result['predicted_high']:,} (+{result['predicted_high_pct']:.2f}%)
-• Low: {result['predicted_low']:,} ({result['predicted_low_pct']:.2f}%)
-• Range: {result['predicted_range']:,} pts ({result['predicted_range_pct']:.2f}%)
+📊 Diffusion: **{diffusion:+d}** ({bullish_count}🟢 vs {bearish_count}🔴) {agree_emoji}
 
-{vol_emoji} **Volatility: {result['volatility_regime']}** (×{result['volatility_multiplier']:.1f})
+🟢 {bull_str}
+🔴 {bear_str}
 
-📍 Reference (Prev Close): {result['reference_price']:,.0f}
+📈 Range: {result['predicted_low']:,} → {result['predicted_high']:,}
+   ({result['predicted_low_pct']:+.2f}% to {result['predicted_high_pct']:+.2f}%)
+
+{vol_emoji} Vol: {result['volatility_regime']} | Ref: {result['reference_price']:,.0f}
 """
     return msg
 
