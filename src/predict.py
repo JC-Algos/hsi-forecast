@@ -2,12 +2,21 @@
 """
 Daily prediction for HSI range and direction.
 Run before market open to get today's forecast.
+
+Supports two modes:
+- legacy: XGBoost only (original)
+- hybrid: Ensemble (XGB+LGB+CAT) for High/Low, CatBoost only for Direction
 """
 
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+import catboost as cb
+import lightgbm as lgb
+import torch
+import torch.nn as nn
+import joblib
 from pathlib import Path
 from datetime import datetime, timedelta
 import json
@@ -15,6 +24,125 @@ import argparse
 
 PROJECT_DIR = Path(__file__).parent.parent
 MODELS_DIR = PROJECT_DIR / "models"
+ENSEMBLE_DIR = MODELS_DIR / "ensemble"
+
+# Default to hybrid mode (ensemble for high/low, catboost for direction)
+USE_HYBRID = True
+
+
+class GRUModel(nn.Module):
+    """GRU model for direction prediction."""
+    def __init__(self, input_size, hidden_size, num_layers):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, 
+                          batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        out, _ = self.gru(x)
+        return self.sigmoid(self.fc(out[:, -1, :]))
+
+
+def load_gru_model():
+    """Load trained GRU model and scaler."""
+    gru_path = MODELS_DIR / "gru_direction.pt"
+    scaler_path = MODELS_DIR / "gru_scaler.pkl"
+    
+    if not gru_path.exists() or not scaler_path.exists():
+        return None, None, None
+    
+    checkpoint = torch.load(gru_path, weights_only=False)
+    hp = checkpoint['hyperparams']
+    
+    model = GRUModel(hp['input_size'], hp['hidden_size'], hp['num_layers'])
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    scaler = joblib.load(scaler_path)
+    
+    return model, scaler, checkpoint['feature_cols']
+
+
+def predict_direction_arima(df: pd.DataFrame) -> tuple[float, str, bool]:
+    """
+    Use ARIMA model to predict direction.
+    
+    Returns:
+        (prob, direction, success): probability, direction string, whether prediction succeeded
+    """
+    from statsmodels.tsa.arima.model import ARIMA
+    import warnings
+    warnings.filterwarnings('ignore')
+    
+    arima_path = MODELS_DIR / "arima_params.pkl"
+    if not arima_path.exists():
+        return 0.0, "N/A", False
+    
+    arima_params = joblib.load(arima_path)
+    order = arima_params['order']
+    
+    # Use processed features for consistent returns data
+    processed_dir = PROJECT_DIR / "data" / "processed"
+    features_df = pd.read_csv(processed_dir / "features.csv", index_col=0, parse_dates=True)
+    
+    if 'hsi_change_pct' not in features_df.columns:
+        return 0.0, "N/A", False
+    
+    returns = features_df['hsi_change_pct'].dropna()
+    
+    if len(returns) < 50:
+        return 0.0, "N/A", False
+    
+    try:
+        model = ARIMA(returns, order=order)
+        fitted = model.fit()
+        forecast = fitted.forecast(steps=1)
+        forecast_val = float(forecast.values[0])
+        
+        direction = "UP" if forecast_val > 0 else "DOWN"
+        # Convert forecast to pseudo-probability (sigmoid-like)
+        prob = 1 / (1 + np.exp(-forecast_val * 100))  # Scale for reasonable range
+        
+        return prob, direction, True
+    except Exception as e:
+        return 0.0, "N/A", False
+
+
+class EnsembleRegressor:
+    """Ensemble of XGBoost, LightGBM, CatBoost for regression."""
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.models = {}
+        self.weights = {"xgb": 0.33, "lgb": 0.33, "cat": 0.34}
+    
+    def load(self, path: Path):
+        """Load all models and weights."""
+        self.models["xgb"] = xgb.XGBRegressor()
+        self.models["xgb"].load_model(path / f"{self.name}_xgb.json")
+        
+        self.models["lgb"] = joblib.load(path / f"{self.name}_lgb.pkl")
+        
+        self.models["cat"] = cb.CatBoostRegressor()
+        self.models["cat"].load_model(path / f"{self.name}_cat.cbm")
+        
+        with open(path / f"{self.name}_weights.json") as f:
+            self.weights = json.load(f)
+    
+    def predict(self, X):
+        """Weighted average prediction."""
+        preds = {
+            "xgb": self.models["xgb"].predict(X),
+            "lgb": self.models["lgb"].predict(X),
+            "cat": self.models["cat"].predict(X),
+        }
+        
+        return (
+            self.weights["xgb"] * preds["xgb"] +
+            self.weights["lgb"] * preds["lgb"] +
+            self.weights["cat"] * preds["cat"]
+        )
 
 
 def fetch_recent_data(days: int = 30) -> pd.DataFrame:
@@ -83,18 +211,77 @@ def calculate_features(df: pd.DataFrame) -> pd.Series:
     return features
 
 
-def load_models():
-    """Load trained XGBoost models."""
-    model_high = xgb.XGBRegressor()
-    model_high.load_model(MODELS_DIR / "range_high.json")
+def load_models(hybrid: bool = True):
+    """
+    Load trained models.
     
-    model_low = xgb.XGBRegressor()
-    model_low.load_model(MODELS_DIR / "range_low.json")
+    Args:
+        hybrid: If True, use XGBoost for Range + CatBoost for Direction (best combo)
+                If False, use XGBoost only (legacy mode)
+    """
+    if hybrid and ENSEMBLE_DIR.exists():
+        # Best combo: XGBoost for Range (lower MAE) + CatBoost for Direction (71% acc)
+        model_high = xgb.XGBRegressor()
+        model_high.load_model(MODELS_DIR / "range_high.json")
+        
+        model_low = xgb.XGBRegressor()
+        model_low.load_model(MODELS_DIR / "range_low.json")
+        
+        # CatBoost for direction (71.4% vs XGBoost 47.6%)
+        model_dir = cb.CatBoostClassifier()
+        model_dir.load_model(ENSEMBLE_DIR / "direction_cat.cbm")
+        
+        return model_high, model_low, model_dir, "xgb+catboost"
+    else:
+        # Legacy mode: XGBoost only
+        model_high = xgb.XGBRegressor()
+        model_high.load_model(MODELS_DIR / "range_high.json")
+        
+        model_low = xgb.XGBRegressor()
+        model_low.load_model(MODELS_DIR / "range_low.json")
+        
+        model_dir = xgb.XGBClassifier()
+        model_dir.load_model(MODELS_DIR / "direction.json")
+        
+        return model_high, model_low, model_dir, "xgboost"
+
+
+def predict_direction_gru(df: pd.DataFrame, features: pd.Series) -> tuple[float, bool]:
+    """
+    Use GRU model to predict direction.
     
-    model_dir = xgb.XGBClassifier()
-    model_dir.load_model(MODELS_DIR / "direction.json")
+    Returns:
+        (probability, success): probability of UP direction and whether prediction succeeded
+    """
+    gru_model, gru_scaler, gru_feature_cols = load_gru_model()
     
-    return model_high, model_low, model_dir
+    if gru_model is None:
+        return 0.5, False
+    
+    # Need sequence of last 10 days
+    SEQUENCE_LENGTH = 10
+    
+    # Get processed features from the data
+    processed_dir = PROJECT_DIR / "data" / "processed"
+    features_df = pd.read_csv(processed_dir / "features.csv", index_col=0, parse_dates=True)
+    
+    if len(features_df) < SEQUENCE_LENGTH:
+        return 0.5, False
+    
+    # Get last SEQUENCE_LENGTH rows
+    X_recent = features_df[gru_feature_cols].iloc[-SEQUENCE_LENGTH:].values
+    
+    # Scale
+    X_scaled = gru_scaler.transform(X_recent)
+    
+    # Create sequence tensor
+    X_seq = torch.FloatTensor(X_scaled).unsqueeze(0)  # (1, seq_len, features)
+    
+    # Predict
+    with torch.no_grad():
+        prob = gru_model(X_seq).item()
+    
+    return prob, True
 
 
 def calculate_volatility_multiplier(df: pd.DataFrame, lookback: int = 20) -> tuple[float, str, float]:
@@ -377,9 +564,13 @@ def calculate_signal_alignment(features: pd.Series, predicted_direction: str) ->
     }
 
 
-def predict_today(output_format: str = "json") -> dict:
+def predict_today(output_format: str = "json", use_hybrid: bool = True) -> dict:
     """
     Make prediction for today's HSI range and direction.
+    
+    Args:
+        output_format: Output format (json/telegram)
+        use_hybrid: If True, use Ensemble for High/Low and CatBoost for Direction
     
     Returns:
         dict with prediction results
@@ -388,11 +579,12 @@ def predict_today(output_format: str = "json") -> dict:
     df = fetch_recent_data(days=30)
     features = calculate_features(df)
     
-    # Load models
-    model_high, model_low, model_dir = load_models()
+    # Load models (hybrid or legacy)
+    model_high, model_low, model_dir, model_type = load_models(hybrid=use_hybrid)
     
     # Get feature order from metadata
-    with open(MODELS_DIR / "metadata.json") as f:
+    metadata_path = ENSEMBLE_DIR / "metadata.json" if model_type == "hybrid" else MODELS_DIR / "metadata.json"
+    with open(metadata_path) as f:
         metadata = json.load(f)
     feature_cols = metadata["feature_cols"]
     
@@ -402,8 +594,17 @@ def predict_today(output_format: str = "json") -> dict:
     # Predict base values
     high_pct_base = model_high.predict(X)[0]
     low_pct_base = model_low.predict(X)[0]
+    
+    # Direction prediction (CatBoost in hybrid mode, XGBoost in legacy)
     direction_prob = model_dir.predict_proba(X)[0, 1]
     predicted_direction = "UP" if direction_prob > 0.5 else "DOWN"
+    
+    # GRU direction prediction (if available)
+    gru_prob, gru_success = predict_direction_gru(df, features)
+    gru_direction = "UP" if gru_prob > 0.5 else "DOWN" if gru_success else None
+    
+    # ARIMA direction prediction
+    arima_prob, arima_direction, arima_success = predict_direction_arima(df)
     
     # Calculate signal alignment for confidence
     signal_alignment = calculate_signal_alignment(features, predicted_direction)
@@ -484,6 +685,15 @@ def predict_today(output_format: str = "json") -> dict:
         "volatility_regime": vol_regime,
         "volatility_multiplier": float(round(vol_multiplier, 2)),
         "gap_adjustment": gap_reason,
+        "model_type": model_type,  # "hybrid" or "xgboost"
+        # GRU model predictions
+        "gru_prob": float(round(gru_prob, 3)) if gru_success else None,
+        "gru_direction": gru_direction,
+        "gru_available": gru_success,
+        # ARIMA model predictions
+        "arima_prob": float(round(arima_prob, 3)) if arima_success else None,
+        "arima_direction": arima_direction,
+        "arima_available": arima_success,
     }
     
     return result
@@ -510,15 +720,11 @@ def format_telegram(result: dict) -> str:
     # Reference day (previous trading day)
     ref_day = "Fri" if today.weekday() in [5, 6, 0] else today.strftime("%a")
     
-    direction_emoji = "📈" if result["direction"] == "UP" else "📉"
-    confidence_pct = result["confidence"]
-    confidence_bar = "█" * int(confidence_pct * 10) + "░" * (10 - int(confidence_pct * 10))
-    
     # Diffusion info
     diffusion = result.get("diffusion", 0)
     bullish_count = result.get("bullish_count", 0)
     bearish_count = result.get("bearish_count", 0)
-    agree = result.get("model_diffusion_agree", True)
+    diffusion_direction = "UP" if diffusion > 0 else "DOWN" if diffusion < 0 else "NEUTRAL"
     
     bullish_factors = result.get("bullish_factors", [])
     bearish_factors = result.get("bearish_factors", [])
@@ -527,12 +733,75 @@ def format_telegram(result: dict) -> str:
     bull_str = ", ".join(bullish_factors) if bullish_factors else "None"
     bear_str = ", ".join(bearish_factors) if bearish_factors else "None"
     
-    # Model probability (convert to direction %)
-    model_prob = result.get("model_prob", 0.5)
-    if result["direction"] == "DOWN":
-        direction_prob = (1 - model_prob) * 100
+    # === 4 Direction Models ===
+    # 1. CatBoost (ML)
+    catboost_dir = result["direction"]
+    catboost_prob = result.get("model_prob", 0.5)
+    catboost_pct = catboost_prob * 100 if catboost_dir == "UP" else (1 - catboost_prob) * 100
+    catboost_emoji = "📈" if catboost_dir == "UP" else "📉"
+    
+    # 2. GRU (Deep Learning)
+    gru_available = result.get('gru_available', False)
+    if gru_available:
+        gru_dir = result['gru_direction']
+        gru_prob = result['gru_prob']
+        gru_pct = gru_prob * 100 if gru_dir == "UP" else (1 - gru_prob) * 100
+        gru_emoji = "📈" if gru_dir == "UP" else "📉"
     else:
-        direction_prob = model_prob * 100
+        gru_dir = None
+        gru_pct = 0
+        gru_emoji = "❓"
+    
+    # 3. ARIMA (Statistical)
+    arima_available = result.get('arima_available', False)
+    if arima_available:
+        arima_dir = result['arima_direction']
+        arima_prob = result['arima_prob']
+        arima_pct = arima_prob * 100 if arima_dir == "UP" else (1 - arima_prob) * 100
+        arima_emoji = "📈" if arima_dir == "UP" else "📉"
+    else:
+        arima_dir = None
+        arima_pct = 0
+        arima_emoji = "❓"
+    
+    # 4. Diffusion (Rule-based)
+    diff_emoji = "📈" if diffusion_direction == "UP" else "📉" if diffusion_direction == "DOWN" else "➖"
+    
+    # Count agreements (4 judges)
+    directions = [catboost_dir]
+    if gru_available:
+        directions.append(gru_dir)
+    if arima_available:
+        directions.append(arima_dir)
+    directions.append(diffusion_direction)
+    
+    up_count = directions.count("UP")
+    down_count = directions.count("DOWN")
+    total_judges = len([d for d in directions if d in ["UP", "DOWN"]])
+    
+    # Consensus with 3:1 confidence
+    if up_count >= 3 and down_count <= 1:
+        consensus = "UP"
+        consensus_emoji = "📈"
+        confidence = "✅ 強烈" if up_count == 4 else "✅ 有信心"
+    elif down_count >= 3 and up_count <= 1:
+        consensus = "DOWN"
+        consensus_emoji = "📉"
+        confidence = "✅ 強烈" if down_count == 4 else "✅ 有信心"
+    elif up_count > down_count:
+        consensus = "UP"
+        consensus_emoji = "📈"
+        confidence = "⚠️ 弱"
+    elif down_count > up_count:
+        consensus = "DOWN"
+        consensus_emoji = "📉"
+        confidence = "⚠️ 弱"
+    else:
+        consensus = "MIXED"
+        consensus_emoji = "⚖️"
+        confidence = "❌ 無方向"
+    
+    vote_str = f"{up_count}↑ vs {down_count}↓"
     
     msg = f"""🎯 HSI Daily Forecast - {day_name} {date_str}
 
@@ -541,16 +810,18 @@ def format_telegram(result: dict) -> str:
 • Low: {result['predicted_low']:,} ({result['predicted_low_pct']:.2f}%)
 • Range: {result['predicted_range']:,} pts ({result['predicted_range_pct']:.2f}%)
 
-{direction_emoji} Direction: {result['direction']} ({direction_prob:.0f}% probability)
-Confidence: [{confidence_bar}] {confidence_pct:.0%}
-Diffusion: {diffusion:+d} ({bullish_count}🟢 vs {bearish_count}🔴) {"✓" if agree else "⚠️"}
+{consensus_emoji} Direction: {consensus} ({vote_str}) | {confidence}
+
+🗳️ 4 Judges:
+• CatBoost (ML): {catboost_emoji} {catboost_dir} ({catboost_pct:.0f}%)
+• GRU (Deep): {gru_emoji} {gru_dir if gru_available else 'N/A'}{f' ({gru_pct:.0f}%)' if gru_available else ''}
+• ARIMA (Stats): {arima_emoji} {arima_dir if arima_available else 'N/A'}{f' ({arima_pct:.0f}%)' if arima_available else ''}
+• Diffusion: {diff_emoji} {diffusion_direction} ({bullish_count}🟢 vs {bearish_count}🔴)
 
 🟢 Bullish: {bull_str}
 🔴 Bearish: {bear_str}
 
-⚡ Volatility Regime: {result['volatility_regime']} (×{result['volatility_multiplier']:.1f})
-
-Model: XGBoost | Accuracy: 72% | MAE: 0.5%
+⚡ Volatility: {result['volatility_regime']} (×{result['volatility_multiplier']:.1f})
 """
     return msg
 
@@ -560,9 +831,10 @@ def main():
     parser.add_argument("--format", choices=["json", "telegram", "both"], default="both",
                        help="Output format")
     parser.add_argument("--save", action="store_true", help="Save prediction to file")
+    parser.add_argument("--legacy", action="store_true", help="Use legacy XGBoost-only mode")
     args = parser.parse_args()
     
-    result = predict_today()
+    result = predict_today(use_hybrid=not args.legacy)
     
     if args.format in ["json", "both"]:
         print("\n=== JSON Output ===")
