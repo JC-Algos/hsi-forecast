@@ -1,0 +1,55 @@
+{
+  "trained_at": "2026-02-01T08:45:20.669982",
+  "n_samples": 784,
+  "n_folds": 18,
+  "feature_cols": [
+    "hsi_prev_close",
+    "hsi_change_pct",
+    "hsi_ema20",
+    "hsi_ma5",
+    "hsi_volatility",
+    "spx_close",
+    "spx_change_pct",
+    "ndx_close",
+    "ndx_change_pct",
+    "usdcnh",
+    "usdcnh_change_pct",
+    "vix",
+    "vix_change_pct",
+    "fxi_close",
+    "fxi_change_pct",
+    "day_of_week"
+  ],
+  "summary": {
+    "high": {
+      "mae": {
+        "mean": 0.6467929805670483,
+        "std": 0.2483821137104875
+      },
+      "rmse": {
+        "mean": 0.8064499581951869,
+        "std": 0.359845122723992
+      }
+    },
+    "low": {
+      "mae": {
+        "mean": 0.7794608480091302,
+        "std": 0.7549289821864514
+      },
+      "rmse": {
+        "mean": 0.9534225399739972,
+        "std": 0.8484216370428193
+      }
+    },
+    "direction": {
+      "accuracy": {
+        "mean": 0.50364044168392,
+        "std": 0.10479145458728487
+      },
+      "auc_roc": {
+        "mean": 0.48117201968572826,
+        "std": 0.12484109382428424
+      }
+    }
+  }
+}

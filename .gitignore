@@ -1,0 +1,31 @@
+# Data files (too large for git)
+data/raw/*.csv
+data/processed/*.csv
+
+# Keep model files (they're the trained output)
+# models/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/*.ipynb
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
