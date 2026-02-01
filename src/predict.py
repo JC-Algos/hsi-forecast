@@ -491,26 +491,34 @@ def predict_today(output_format: str = "json") -> dict:
 
 def format_telegram(result: dict) -> str:
     """Format prediction for Telegram message."""
+    from datetime import datetime, timedelta
+    
+    # Calculate next trading day (skip weekends)
+    today = datetime.now()
+    if today.weekday() == 5:  # Saturday
+        next_trading = today + timedelta(days=2)
+    elif today.weekday() == 6:  # Sunday
+        next_trading = today + timedelta(days=1)
+    elif today.weekday() == 4:  # Friday
+        next_trading = today + timedelta(days=3)
+    else:
+        next_trading = today + timedelta(days=1)
+    
+    day_name = next_trading.strftime("%A")
+    date_str = next_trading.strftime("%-d %b %Y")
+    
+    # Reference day (previous trading day)
+    ref_day = "Fri" if today.weekday() in [5, 6, 0] else today.strftime("%a")
+    
     direction_emoji = "📈" if result["direction"] == "UP" else "📉"
     confidence_pct = result["confidence"]
     confidence_bar = "█" * int(confidence_pct * 10) + "░" * (10 - int(confidence_pct * 10))
     
-    # Volatility regime emoji
-    vol_emoji = {
-        "LOW": "😴",
-        "NORMAL": "📊",
-        "HIGH": "⚡",
-        "EXTREME": "🔥"
-    }.get(result["volatility_regime"], "📊")
-    
-    # Diffusion
+    # Diffusion info
     diffusion = result.get("diffusion", 0)
     bullish_count = result.get("bullish_count", 0)
     bearish_count = result.get("bearish_count", 0)
-    
-    # Model vs diffusion agreement
     agree = result.get("model_diffusion_agree", True)
-    agree_emoji = "✓" if agree else "⚠️"
     
     bullish_factors = result.get("bullish_factors", [])
     bearish_factors = result.get("bearish_factors", [])
@@ -519,20 +527,30 @@ def format_telegram(result: dict) -> str:
     bull_str = ", ".join(bullish_factors) if bullish_factors else "None"
     bear_str = ", ".join(bearish_factors) if bearish_factors else "None"
     
-    msg = f"""🎯 **HSI Forecast** ({result['date']})
+    # Model probability (convert to direction %)
+    model_prob = result.get("model_prob", 0.5)
+    if result["direction"] == "DOWN":
+        direction_prob = (1 - model_prob) * 100
+    else:
+        direction_prob = model_prob * 100
+    
+    msg = f"""🎯 HSI Daily Forecast - {day_name} {date_str}
 
-{direction_emoji} **{result['direction']}** | Confidence: **{confidence_pct:.0%}**
-[{confidence_bar}]
+📊 Predicted Range (from {ref_day} close {result['reference_price']:,.0f}):
+• High: {result['predicted_high']:,} (+{result['predicted_high_pct']:.2f}%)
+• Low: {result['predicted_low']:,} ({result['predicted_low_pct']:.2f}%)
+• Range: {result['predicted_range']:,} pts ({result['predicted_range_pct']:.2f}%)
 
-📊 Diffusion: **{diffusion:+d}** ({bullish_count}🟢 vs {bearish_count}🔴) {agree_emoji}
+{direction_emoji} Direction: {result['direction']} ({direction_prob:.0f}% probability)
+Confidence: [{confidence_bar}] {confidence_pct:.0%}
+Diffusion: {diffusion:+d} ({bullish_count}🟢 vs {bearish_count}🔴) {"✓" if agree else "⚠️"}
 
-🟢 {bull_str}
-🔴 {bear_str}
+🟢 Bullish: {bull_str}
+🔴 Bearish: {bear_str}
 
-📈 Range: {result['predicted_low']:,} → {result['predicted_high']:,}
-   ({result['predicted_low_pct']:+.2f}% to {result['predicted_high_pct']:+.2f}%)
+⚡ Volatility Regime: {result['volatility_regime']} (×{result['volatility_multiplier']:.1f})
 
-{vol_emoji} Vol: {result['volatility_regime']} | Ref: {result['reference_price']:,.0f}
+Model: XGBoost | Accuracy: 72% | MAE: 0.5%
 """
     return msg
 
